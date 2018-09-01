@@ -1,0 +1,708 @@
+#+TITLE: To Kill A Mocking Framework
+ # #+TITLE: Tools and techniques for testing callbacks
+#+AUTHOR: Alastair Rankine
+#+EMAIL: alastair@girby.net
+
+#+BEGIN_NOTES
+First of all I'd like to apologise to the estate of Harper Lee and indeed everyone who is a fan of the book whose title is used as a bad pun.
+
+Second of all I'd like to clarify that I'm not here to 'kill' anything, least of all your favourite mocking frameworks.
+
+What I'd like to do is to share some thoughts and recipies which you can apply to testing your code. Maybe you can use them instead of a mocking framework. Or maybe not!
+
+Hi, my name is Alastair. I'm a software developer in the AMM group at Morgan Stanley. I've been coding in C++ professionally since about 1992 or so.
+#+END_NOTES
+
+* Callbacks Are Everywhere!
+
+#+BEGIN_SRC c++
+  auto square_add = [] (auto a, auto b) {
+    return a * a + b;
+  };
+  int is[] = { 1, 2, 3 };
+  auto q = std::accumulate(std::begin(is), std::end(is), 0, square_add);
+#+END_SRC
+
+#+BEGIN_NOTES
+Callbacks are commonly used to deliver data and pass control from one component to another. They have many uses, such as handling asychronous events, and providing customization and extensions to existing components.
+
+There is a more general form of callback used in functional programming. If you're familiar with lambda calculus you will know about beta reduction. Very basically, this is where you take some variables and inject them into a function body.
+
+We do this operation pretty frequently these days in C++, but often think of it as a calling a callback. Consider
+
+Here we are defining the =square_add= function as a polymorphic lambda - which means it can be called with any types for a and b, and return the results accordingly.
+
+For the bulk of this talk I'm going to limit the problem domain to callbacks which have a known type - although some techniques will be applicable for polymorphic callbacks like this.
+#+END_NOTES
+
+* Testing
+
+Testing challenges?
+
+#+BEGIN_NOTES
+
+If we have code which calls a callback, how do we test it? It has to call the callback in the right way with the right parameters. The callback can return values or modify some external state, both of which the code under test has to handle correctly.
+
+In the case of std::accumulate, it has to call the callback once for each value in the input range, and accumulate the result from the previous call.
+
+What makes the callback a callback, instead of merely a function call, is the fact that the client supplies the callback to be used. In the case of =std::accumulate= we pass a binary operation, which is a special type of callback which accepts two values of a given type and returns a third. There are other ways of providing callbacks, and you'll see examples of them in this talk.
+
+We can construct a test suite which provides various inputs to the code under test, and we can check that it returns the correct values, but how do we check that it called the callback in the right way, or even at all?
+#+END_NOTES
+
+* Tokenizer Version 1
+
+#+BEGIN_NOTES
+
+We can write components called mocks which enable us to test code which issues callbacks. The mock typically allows us to specify, on a per test-case basis, how the callback is to be called, and what value (if any) to return back to the code under test.
+
+Let's look at an example. Here's some code which tokenizes input. It's not exactly a masterpiece of software engineering, but hopefully the intent is clear, namely that a callback is called for each whitespace-delimited token in the input.
+#+END_NOTES
+
+#+BEGIN_SRC c++
+template <typename callback_t>
+struct tokenizer1 {
+  callback_t& callback_;
+  tokenizer1(callback_t& callback) : callback_{callback} {}
+
+  void operator()(std::string_view input) const {
+    const char ws[] = " \t\n";
+    size_t a{}, b{};
+    do {
+      a = input.find_first_not_of(ws, b);
+      if (a == input.npos) return;
+      b = input.find_first_of(ws, a);
+      auto tok = input.substr(a, b == input.npos? b : b - a);
+      // call callback here!
+      callback_.string_token(tok);
+    } while (b != input.npos);
+  }
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+
+This class is templated on the type of the callback object. This is, in my experience anyway, a pretty common thing to do. Alternatively, we could require our callbacks inherit from an abstract base class, and use virtual function dispatch. In fact this makes mocking midly more difficult, and I'll discuss it later.
+
+At the commented line there's call a member function =string_token= with a single argument, namely the contents of the found token. Hopefully you can see that effective mocking is the only way to test this code - it doesn't return any values or modify any global state.
+
+A better design choice here would be to require the callback to be callable directly, rather than to require a member function called =string_token=. This is true, but this leads to more interesting problems, which I want to solve later.
+
+So how do we write a test case?
+#+END_NOTES
+
+* Testing Tokenizer
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(tokenizer_test) {
+  /* what type goes here?? */ mock_callback;
+  tokenizer1 test_me{mock_callback};
+  test_me("hello");
+  /* how do we check that the callback is called? */
+}
+#+END_SRC
+
+* Manual Mocking
+
+One way to solve this problem is to write a mock object for each test case. So for example:
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(tokenizer_test_manual_mock) {
+  struct mock_callback {
+    int calls = 0;
+    void string_token(std::string_view seen) {
+      ++calls;
+      BOOST_TEST(seen == "hello");
+    }
+  } callback;
+  tokenizer1 tok {callback};
+  tok("hello");
+  BOOST_TEST(callback.calls == 1);
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+
+There are two assertions here, and they are both crucial. Obviously we test that the value provided to the callback matches our expectation.
+
+However we definitely don't want a false positive on the test if the tokenizer fails to call the callback at all.
+
+One way to solve this is to add a counter which is incremented each time the mocked function is called, and at the end of the test we check that it was called the expected number of times.
+
+Hopefully you are looking at this code in disgust! There's a lot of boilerplate here, and it would have to be repeated for each test case. Not only that, but when it comes time to add an =int_token= callback, all of the existing test cases would be broken.
+
+#+END_NOTES
+
+* Mocking Frameworks
+
+Mocking frameworks exist to make mocking easier. Google Mock is one such framework, and here's how you would solve the problem using that:
+
+#+BEGIN_SRC c++
+struct tokenizer1_test : ::testing::Test {
+  struct mock_callback {
+    MOCK_METHOD1(string_token, void(std::string_view));
+  };
+  mock_callback callback_;
+  tokenizer1<mock_callback> tokenizer_{callback_};
+};
+
+TEST_F(tokenizer1_test, hello) {
+  EXPECT_CALL(callback_, string_token("hello"sv)).Times(1);
+  tokenizer_("world");
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+Note that the test cases are quite concise. Instantiating the mock object and passing it into the code under test is all handled by the fixture class. So in the test all we do is specify the input to the tokenizer, and the expected callback.
+
+We run the test, the Google Mock code ensures that the =string_token= function is called with the correct argument, in this case the string "hello". If the callback is called with the wrong argument, we get a helpful error message.
+#+END_NOTES
+
+* Google Test Error
+
+#+BEGIN_EXAMPLE
+[ RUN      ] tokenizer1_test.hello
+unknown file: Failure
+
+Unexpected mock function call - returning directly.
+    Function call: string_token({ 'w' (119, 0x77), 'o' (111, 0x6F), 'r' (114, 0x72), 'l' (108, 0x6C), 'd' (100, 0x64) })
+Google Mock tried the following 1 expectation, but it didn't match:
+
+../tokenizer1_gtest.cpp:16: EXPECT_CALL(callback_, string_token("hello"sv))...
+  Expected arg #0: is equal to { 'h' (104, 0x68), 'e' (101, 0x65), 'l' (108, 0x6C), 'l' (108, 0x6C), 'o' (111, 0x6F) }
+           Actual: { 'w' (119, 0x77), 'o' (111, 0x6F), 'r' (114, 0x72), 'l' (108, 0x6C), 'd' (100, 0x64) }
+         Expected: to be called once
+           Actual: never called - unsatisfied and active
+../tokenizer1_gtest.cpp:16: Failure
+Actual function call count doesn't match EXPECT_CALL(callback_, string_token("hello"sv))...
+         Expected: to be called once
+           Actual: never called - unsatisfied and active
+[  FAILED  ] tokenizer1_test.hello (0 ms)
+#+END_EXAMPLE
+
+#+BEGIN_NOTES
+Please bear in mind I am *not* an expert in Google Mock! I may have screwed something up here - but the intention is to declare your expectations for the mocked function in an intuitive manner. All of the mocking frameworks I looked at relied on a declarative syntax.  I highly recommend looking at some of these mocking frameworks, I cannot possibly do them justice here.
+
+For the most part mocking frameworks are seprate from unit test frameworks. Although Google Test and Google Mock are bundled together, you can use the latter without the former.
+#+END_NOTES
+
+* Mocking with =std::function=
+
+#+BEGIN_NOTES
+So finally we've arrived at the substance of this talk, which is to to offer an alternative which is hopefully comparable to mocking frameworks in many situations.
+
+The basic idea is that for each member function callback that you want to mock out, use a =std::function= and bind a lambda to it in the test case.
+#+END_NOTES
+
+#+BEGIN_SRC c++
+struct tokenizer1_fixture {
+  struct mock_callback {
+    std::function<void(std::string_view)> string_token;
+  };
+  mock_callback callback_;
+  tokenizer1<mock_callback> tokenizer_{callback_};
+};
+
+BOOST_FIXTURE_TEST_CASE(hello_counted, tokenizer1_fixture) {
+  int calls = 0;
+  callback_.string_token = [&] (std::string_view seen) {
+    ++calls;
+    BOOST_TEST(seen == "hello");
+  };
+  tokenizer_("   hello    ");
+  BOOST_TEST(calls == 1);
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+The calling code doesn't know that it's not actually calling a "real" member function, and it doesn't care.
+
+Lambdas are extremely helpful here, because the allow us to specify the behaviour of the mocked out function locally to the test case. It's hopefully easy to understand the intent of the test as a whole - and of the expectations for the callback itself.
+
+If we forget to bind a lambda to the std::function it will remain unbound - and so when it is called by the code under test, an exception will be thrown. To my mind, this is good default behaviour. So if the code calls a callback which we weren't expecting, a test failure will result.
+
+For the sake of brevity I'm going to handwave away the issue of return values. Even though we are returning void here, you could hopefully see that the lambda could return any value.
+#+END_NOTES
+
+
+* Limitations of mocking with =std::function= 1
+
+No overloading!
+
+#+BEGIN_SRC c++
+  struct mock_callback {
+    std::function<void(std::string_view)> token_string_view_;
+    std::function<void(int)> token_int_;
+
+    void token(std::string_view s) { token_string_view_(s); }
+    void token(int i) { token_int_(i); }
+  };
+#+END_SRC
+
+#+BEGIN_NOTES
+There are some cases in which this doesn't work. Most obviously, if the callback function signature is overloaded, or has default parameters, you can't use a std::function as a mock. We'll discuss these later (time permitting).
+#+END_NOTES
+
+* Limitations of mocking with =std::function= 2
+
+No overriding!
+
+#+BEGIN_SRC c++
+  struct callback_interface {
+    virtual void string_token(std::string_view) = 0;
+  };
+  struct mock_callback : callback_interface {
+    std::function<void(std::string_view)> string_token_fn_;
+    void string_token(std::string_view arg) override { string_token_fn_(arg); }
+  };
+#+END_SRC
+
+#+BEGIN_NOTES
+Also you can't override a virtual function in a base class using a std::function. In this case the mock needs a trampoline function to redirect control flow to the matching =std::function=.
+
+A preprocessor macro should probably used to eliminate the repetition here. I'll leave that as an exercise for the viewer...
+#+END_NOTES
+
+* Limitations of mocking with =std::function= 3
+
+Duplication of function signatures
+
+#+BEGIN_SRC c++
+  struct {
+     std::function<void(std::string_view, int, double) foo;
+  } callback;
+
+  callback.foo = [&] (std::string_view s, int i, double d) { /* */ };
+#+END_SRC
+
+#+BEGIN_NOTES
+There is some repetition here, namely in the parameter types. Each test case which mocks out =foo= has to declare a lambda which accepts a =string_token=, an int and a double. However for the purposes of defining the lambda you could specify a compatible type - or rely on =auto=.
+
+Also, if you want to change the function signature of the callback - like adding an additional parameter for example - all of your existing test lambdas will have to change. However maybe that's a good thing? You'll almost certainly need to change the lambdas anyway to check that the correct values are being passed.
+
+Admittedly I have a bias in favour of low arity functions, functions with no more than 2-3 paramters. Personally, if I find I want to add a fourth, or possibly third, parameter then I will almost certainly start thinking about wrapping those parameters in a struct.
+
+What about that pesky call counting code? Can we get rid of that as well?
+#+END_NOTES
+
+* Decorated Callable
+
+#+BEGIN_SRC c++
+template <typename decorator_t, typename callable_t>
+struct decorated_callable {
+  decorator_t decorator_;
+  callable_t callable_;
+
+  template <typename ... args_t>
+  auto operator() (args_t&& ... args) {
+    decorator_(std::forward<args_t>(args)...);
+    return callable_(std::forward<args_t>(args)...);
+  }
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+Let's have a quick diversion into a helper class =decorated_callable=. The idea is to wrap an existing callable object, such that we can call a decorator function before calling the callable itself.
+
+Hopefully this is pretty straightforward. We call the decorator first, and then the callable.
+
+What we're going to do is decorate our mock functions - such as the lambdas we use in the test case - with an object which counts the number of calls and checks that it meets our expectation.
+#+END_NOTES
+
+* Call Count Checker
+
+#+BEGIN_SRC c++
+// this code is flawed - for exposition only
+struct call_count_checker {
+  int calls_;
+  int expected_;
+  template <typename ... args_t>
+  void operator() (args_t&&...) {
+    ++calls_;
+  }
+  ~call_count_checker() {
+    BOOST_TEST(calls_ == expected_);
+  }
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+This class is kindof what we want. Basically it will decorate our test code with a counter which will check the call count when the test exits.
+
+We'll create a helper function =expect_calls= which we'll use to decorate our test lambda with the =call_count_checker=. The result is assigned to the =std::function= in the mock object.
+#+END_NOTES
+
+* Using Call Count Checker
+
+#+BEGIN_SRC c++
+template <typename Fn>
+auto expect_calls(int expected, Fn fn) {
+  return decorated_callable<call_count_checker, Fn>{{0, expected}, fn};
+}
+
+BOOST_AUTO_TEST_CASE(hello_expect_calls) {
+  callback_.string_token = expect_calls(1, [] (std::string_view seen) {
+      BOOST_TEST(seen == "hello");
+    });
+  tokenizer_("hello");
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+It would be nice if this worked, but it doesn't, and the reason may be not obvious. It is actually a requirement of =std::function= that when you bind an object to it, that object is copied. Now obviously our lambda is copyable but the =call_count_checker= certainly isn't!
+
+Well, technically it is copyable, but it shoudln't be. If you copy the call_count_checker then you need to ensure that *both* the original and the copy are called the expected number of times. Fundametally it doesn't make semantic sense for the object to be copied.
+
+There's a second problem which is more of a usability issue. If the call count check fails, it will report a failure from within the call_count_checker destructor - but this doesn't tell you which mocked function you were in! So in addition to reporting the error, we want to help the developer to know which mock function was the problem.
+#+END_NOTES
+
+* Call Count Checker Take 2
+
+#+BEGIN_SRC c++
+  using source_location = std::experimental::source_location;
+
+  // nested class within call_count_checker
+  struct state {
+    state(source_location&& location, unsigned expected)
+      : location_{std::move(location)}, expected_{expected}
+    {}
+    ~state() {
+      BOOST_TEST(expected_ == calls_,
+        "Function defined at " << location_.file_name() << ':' << location_.line()
+        << " expected " << *expected_ << " calls, " << calls_ << " seen");
+      }
+    }
+    const source_location location_;
+    const unsigned expected_;
+    unsigned calls_ {};
+  };
+#+END_SRC
+
+#+REVEAL: split
+
+#+BEGIN_SRC c++
+  class call_count_checker {
+    struct state { /* ... */  };
+    std::shared_ptr<state> state_;
+  public:
+    call_count_checker(unsigned expected, source_location&& location
+                       = source_location::current())
+      : state_{std::make_shared<state>(std::move(location), expected)}
+    {}
+    call_count_checker(const call_count_checker&) = default;
+    call_count_checker(call_count_checker&&) = default;
+
+    template <typename ... Args>
+    void operator() (Args&& ...) const {
+      state_->calls_ += 1;
+    }
+  };
+#+END_SRC
+
+#+BEGIN_NOTES
+Solving the copyability problem is fairly easy: we move the relevant state into an object which is shared amongst all the copies of the call_count_checker. Like so:
+
+Putting all of the state inside an object which is owned by =std::shared_ptr= lets us generate as many copies as we like, and the call count will be checked against the expected value when the last instance is deleted.
+
+When the =call_count_checker= is created in this way, the source file and line are captured. =std::experimental::source_location= is available in GCC but unfortunately not clang yet. In the absence of this, we can simulate it via preprocessor macros which capture =__FILE__= and =__LINE__=.
+#+END_NOTES
+
+* Call Count Checker Error
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_expect_calls_fail, *boost::unit_test::expected_failures(1)) {
+  callback_.string_token = expect_calls(1, [] (std::string_view) {});
+  tokenizer_("");
+}
+#+END_SRC
+#+BEGIN_EXAMPLE
+../mocking.hpp(75): error: in "tokenizer1_test/hello_expect_calls_fail": Function defined at ../tokenizer1_test2.cpp:43 expected 1 calls, 0 seen
+#+END_EXAMPLE
+
+#+BEGIN_NOTES
+The error message reported is fairly self-explanatory:
+
+Obviously it would be ideal if we ONLY reported the location of the lambda but I don't know of a way to do that with Boost Test.
+#+END_NOTES
+
+* Varying expected values
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_world_1) {
+  auto expect_world = expect_calls(1, [&] (std::string_view seen) {
+      BOOST_TEST(seen == "world");
+    });
+  auto expect_hello = expect_calls(1, [&] (std::string_view seen) {
+      BOOST_TEST(seen == "hello");
+      callback_.string_token = expect_world;
+    });
+  callback_.string_token = expect_hello;
+  tokenizer_("hello world");
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+Hopefully everyone's happpy so far. We define mock classes with std::function and bind to them with expect_calls. Now what happens when your callback is called multiple times with different parameters?
+
+Well you *could* bind a new instance of expect_calls from within another. I would suggest this is not ideal!
+#+END_NOTES
+
+* Multiple Expected Values
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_world_2) {
+  const char* exp_toks[] = { "hello", "world" };
+  callback_.string_token = expect_calls(2,
+    [exp=exp_toks] (std::string_view seen) mutable {
+      BOOST_TEST(seen == *exp++);
+    });
+  tokenizer_("hello world");
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+In my opinion a better approach would be something like this:
+
+Here we expect =string_token= to be called twice, once with "hello" subsequently with "world". So we first define the expected values in an array, and then define a mutable lambda which captures an iterator to the start of the array, and increments each time it is called.
+
+But what if you don't know the order in which the calls will come? For example, you expect 2 calls to your callback, but you don't know which will come first.
+#+END_NOTES
+
+* Unique Tokenizer
+
+#+BEGIN_SRC c++
+/// calls callback with each unique token
+template <typename callback_t>
+struct unique_tokenizer {
+  callback_t& callback_;
+
+  void operator()(std::string_view input) const {
+    struct {
+      std::unordered_set<std::string_view> tokens_;
+      void string_token(std::string_view word) {
+        tokens_.insert(word);
+      }
+    } uniqifier;
+    tokenizer1 tok {uniqifier};
+    tok(input);
+    for (const auto& t : uniqifier.counts_) {
+      callback_.string_token(t);
+    }
+  }
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+The tokenizer which we've been testing up till now does not exhibit the required nondeterminism, so let's use a different example to illustrate the point.
+
+This masterpiece of software engineering works out the unique tokens in the input and calls the callback wth each, including the count.
+
+Here we use our tokenizer 
+
+#+END_NOTES
+
+* Testing Unique Tokenizer
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_world) {
+  std::set expected { "hello"sv, "world"sv };
+  callback_.string_token = expect_calls(2, [&] (std::string_view tok) {
+      BOOST_TEST(expected.erase(tok) == 1, word << " not expected");
+    });
+  tokenizer_("hello world");
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+Because we are using an unordered_set we can't determine the order of the output callbacks. So we need to do something like this:
+
+Here we're removing values from the set as they are seen. If we see the same value twice, the call to erase it will return 0, which will fail the test.
+
+For what it's worth, a similar technique with a sequenced container could be used for when the callback order is well defined. Perhaps =std::queue= would be useful and possibly clearer.
+#+END_NOTES
+
+
+* Tokenizer Version 2
+
+#+BEGIN_SRC c++
+template <typename callback_t>
+struct tokenizer2 {
+  callback_t& callback_;
+  tokenizer2(callback_t& c) : callback_{c} {}
+
+  void operator()(std::string_view input) const {
+    const char ws[] = " \t\n";
+    size_t a{}, b{};
+    do {
+      a = input.find_first_not_of(ws, b);
+      if (a == input.npos) return;
+      b = input.find_first_of(ws, a);
+      auto tok = input.substr(a, b == input.npos? b : b - a);
+      if (int i; std::from_chars(tok.begin(), tok.end(), i).ec == std::errc{}) {
+        callback_.int_token(i);
+      } else {
+        callback_.string_token(tok);
+      }
+    } while (b != input.npos);
+  }
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+OK so let's enhance our tokenizer a bit. Here's version 2 and it now attempts to convert each token to an int. If it's successful it calls a new callback =int_token=, and if not it calls =string_token=. Again I don't claim this is great code!
+#+END_NOTES
+
+* Testing Tokenizer Version 2
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_123) {
+  callback_.string_token = expect_calls(1, [] (std::string_view seen) {
+      BOOST_TEST(seen == "hello");
+    });
+  callback_.int_token = expect_calls(1, [] (int seen) {
+      BOOST_TEST(seen == 123);
+    });
+  tokenizer_("hello 123");
+}
+#+END_SRC
+
+#+BEGIN_NOTES
+So we can create a mock object in the usual way and bind lambdas to check the parameters passed to the callbacks:
+
+So far so good, but there's a potential problem here. Let's say we expect the callbacks to be called in the order that the tokens are found in the input. In the above test, we don't have a way to specify that the call to int_token comes after the call to string_token. Sometimes that can be very important!
+
+So in the int_token handler we ideally want to check the call count for string_token to make sure that it is 1. 
+
+Now of course we have the call count for each mocked function but it is inside the call_count_checker decorator. And that is inside the now-type-erased std::function, which means we can't get to it.
+#+END_NOTES
+
+* Accessing Call Count Checker?
+
+(Possible diagram goes here)
+
+#+BEGIN_NOTES
+There's a solution here which uses the code we have written so far, just rearranging it slightly.
+
+So currently we have our test lambda, which is decorated with a call_count_checker into a decorated_callable, and the result is then put inside a std::function.
+
+What about instead of decorating the lambda, we decorate the std::function? We then bind the lambda to the std::function inside the decorated_callable. 
+
+There are two enhancements we need to make here. We need to make the call_count_checker both default constructible and assignable, because we need to instantiate the mock object before assigning an expect_calls object to it.
+
+Fundamentally we just change the state object which lives inside the call_count_checker. The expected call count is now optional, which means it can be default constructed. 
+
+#+END_NOTES
+
+* Counted Callable Version 2
+
+#+BEGIN_SRC c++
+  struct state {
+    state(source_location&& location, std::optional<unsigned> expected)
+      : location_{std::move(location)}
+      , expected_{expected}
+    {}
+    ~state() {
+      if (expected_) {
+        BOOST_TEST(*expected_ == calls_, "Function defined at "
+                   << location_.file_name() << ':' << location_.line()
+                   << " expected " << *expected_ << " calls, " << calls_ << " seen");
+      }
+    }
+    const source_location location_;
+    const std::optional<unsigned> expected_;
+    unsigned calls_ {};
+  };
+#+END_SRC
+
+#+BEGIN_NOTES
+We add assignment operators to the call_count_checker as well as the decorated_callable. In the latter case we need these to be templated such that the lambda can be assigned to the std::function.
+#+END_NOTES
+
+* Counted Function
+
+#+BEGIN_SRC c++
+template <typename>
+struct counted_function;
+
+template <typename Ret, typename ... Args>
+struct counted_function<Ret(Args...)>
+  : decorated_callable<call_count_checker, std::function<Ret(Args...)>>
+{
+  using base_t = decorated_callable<call_count_checker, std::function<Ret(Args...)>>;
+
+  using base_t::decorated_callable;
+  using base_t::operator=;
+  using base_t::decorator;
+
+  auto current_count() const { return decorator().current_count(); }
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+From this we can create =counted_function=, which is just like =std::function= but is decorated with a call_count_checker.
+#+END_NOTES
+
+* Putting it All Together 1
+
+#+BEGIN_SRC c++
+struct tokenizer2_fixture {
+  struct mock_callback {
+    counted_function<void(std::string_view)> string_token;
+    counted_function<void(int)> int_token;
+  };
+
+  mock_callback callback_;
+  tokenizer2<mock_callback> tokenizer_{callback_};
+};
+#+END_SRC
+
+#+BEGIN_NOTES
+So putting it all together we can create our mock object in the familiar way:
+
+And now we can get access to the call count of each mocked function:
+#+END_NOTES
+
+* Putting it All Together 2
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_123_ordered) {
+  callback_.string_token = expect_calls(1, [] (std::string_view seen) {
+      BOOST_TEST(seen == "hello");
+    });
+  callback_.int_token = expect_calls(1, [&] (int seen) {
+      BOOST_TEST(callback_.string_token.current_count() == 1);
+      BOOST_TEST(seen == 123);
+    });
+  tokenizer_("hello 123");
+}
+#+END_SRC
+
+* Another sequencing option
+
+#+BEGIN_SRC c++
+BOOST_AUTO_TEST_CASE(hello_123_variant) {
+  std::deque<std::variant<std::string_view, int>> exp {{ "hello"sv, 123 }};
+
+  auto check_token = expect_calls(size(exp), [&] (auto seen) {
+    auto* next_exp = std::get_if<decltype(seen)>(&exp.front());
+    BOOST_REQUIRE(next_exp);
+    BOOST_TEST(*next_exp == seen);
+    exp.pop_front();
+    });
+  callback_.int_token = check_token;
+  callback_.string_token = check_token;
+  tokenizer_("hello 123");
+}
+#+END_SRC
+
+
+* Further Enhancements
+
+Come talk to me about
+- Overloaded functions
+- Mocking out the system clock
+- ...
+
+* Further Reading
+
+* Contact Details
